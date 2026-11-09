@@ -258,6 +258,12 @@ add_library(velox SHARED jni/VeloxJniWrapper.cc)
 target_link_libraries(velox PUBLIC gluten_velox_impl gluten)
 
 option(BUILD_TRINO "Build libgluten_trino.so for the Trino integration" OFF)
+# The Trino integration builds against upstream Velox, which lacks the
+# hash-table serialization and extensible bloom filter of Gluten's Velox pin.
+option(GLUTEN_UPSTREAM_VELOX "Build against upstream Velox" ${BUILD_TRINO})
+if(GLUTEN_UPSTREAM_VELOX)
+  target_compile_definitions(gluten_velox_impl PRIVATE GLUTEN_UPSTREAM_VELOX)
+endif()
 if(BUILD_TRINO)
   add_library(gluten_trino SHARED trino/TrinoJniWrapper.cc
                                   trino/TrinoPageSerde.cc)

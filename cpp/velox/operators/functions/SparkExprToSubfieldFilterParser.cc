@@ -28,6 +28,7 @@ using namespace facebook::velox;
 
 namespace {
 
+#ifndef GLUTEN_UPSTREAM_VELOX
 // Evaluates an expression as a constant. Returns nullptr if the expression is
 // not constant or evaluation fails. Errors are intentionally swallowed because
 // a non-evaluable expression simply means the filter cannot be pushed down.
@@ -92,6 +93,7 @@ class SparkMightContain final : public common::BigintValuesUsingBloomFilter {
   std::unique_ptr<BloomFilterView> view_;
   int64_t seed_;
 };
+#endif
 
 std::optional<std::pair<facebook::velox::common::Subfield, std::unique_ptr<facebook::velox::common::Filter>>> combine(
     facebook::velox::common::Subfield& subfield,
@@ -166,7 +168,9 @@ SparkExprToSubfieldFilterParser::leafCallToSubfieldFilter(
       }
       return std::make_pair(std::move(subfield), facebook::velox::exec::isNotNull());
     }
-  } else if (scanBloomFilterPushdownEnabled_ && call.name() == "might_contain" && !negated) {
+  }
+#ifndef GLUTEN_UPSTREAM_VELOX
+  else if (scanBloomFilterPushdownEnabled_ && call.name() == "might_contain" && !negated) {
     // Matches: might_contain(bloomFilter, xxhash64_with_seed(seed, field)).
     GLUTEN_CHECK(
         call.inputs().size() == 2,
@@ -203,6 +207,7 @@ SparkExprToSubfieldFilterParser::leafCallToSubfieldFilter(
     }
     LOG(WARNING) << "might_contain could not be converted to a subfield filter";
   }
+#endif
   return std::nullopt;
 }
 
