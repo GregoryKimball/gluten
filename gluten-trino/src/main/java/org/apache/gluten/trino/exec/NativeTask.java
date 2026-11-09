@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * One native Gluten task per Trino task. Gluten fixes a task's splits when it is created, so the
@@ -47,10 +48,14 @@ public final class NativeTask {
   private final Map<String, String> sessionConf;
   private final String spillDir;
   private final Executor executor;
+  private final boolean ucxExchange;
   private final List<BoundedQueue<byte[]>> inputs = new ArrayList<>();
   private final BoundedQueue<Page> output;
   private final AtomicBoolean started = new AtomicBoolean();
   private volatile boolean closed;
+  // UCX exchange updates go to the native task once it exists.
+  private final List<Consumer<Long>> pendingUpdates = new ArrayList<>();
+  private long handle;
 
   public NativeTask(
       String taskId,
@@ -59,13 +64,15 @@ public final class NativeTask {
       Map<String, String> sessionConf,
       String spillDir,
       Executor executor,
-      long queueBytes) {
+      long queueBytes,
+      boolean ucxExchange) {
     this.taskId = taskId;
     this.translation = translation;
     this.serde = serde;
     this.sessionConf = sessionConf;
     this.spillDir = spillDir;
     this.executor = executor;
+    this.ucxExchange = ucxExchange;
     for (int i = 0; i < translation.inputs().size(); i++) {
       inputs.add(new BoundedQueue<>(queueBytes));
     }
@@ -82,6 +89,28 @@ public final class NativeTask {
 
   BlockEncodingSerde serde() {
     return serde;
+  }
+
+  /** Adds an upstream task location for UCX exchange input {@code input}. */
+  public void addRemoteSplit(int input, String location) {
+    update(handle -> TrinoNative.addRemoteSplit(handle, input, location));
+  }
+
+  public void noMoreRemoteSplits(int input) {
+    update(handle -> TrinoNative.noMoreRemoteSplits(handle, input));
+  }
+
+  /** Sets the final consumer count of a broadcast or arbitrary UCX output. */
+  public void noMoreOutputBuffers(int numBuffers) {
+    update(handle -> TrinoNative.noMoreOutputBuffers(handle, numBuffers));
+  }
+
+  private synchronized void update(Consumer<Long> update) {
+    if (handle == 0) {
+      pendingUpdates.add(update);
+    } else {
+      update.accept(handle);
+    }
   }
 
   /** Starts the native task with the table scan's splits; does nothing if already started. */
@@ -103,9 +132,10 @@ public final class NativeTask {
 
   private void run(List<byte[]> splitInfos) {
     Thread.currentThread().setName("gluten-native-" + taskId);
-    NativePageSource[] sources = new NativePageSource[inputs.size()];
-    byte[][] schemas = new byte[inputs.size()][];
-    for (int i = 0; i < inputs.size(); i++) {
+    int javaInputs = ucxExchange ? 0 : inputs.size();
+    NativePageSource[] sources = new NativePageSource[javaInputs];
+    byte[][] schemas = new byte[javaInputs][];
+    for (int i = 0; i < javaInputs; i++) {
       BoundedQueue<byte[]> queue = inputs.get(i);
       sources[i] = () -> {
         try {
@@ -127,6 +157,13 @@ public final class NativeTask {
     try {
       handle = TrinoNative.createTask(
           translation.plan(), splitInfos.toArray(byte[][]::new), sources, schemas, sessionConf, spillDir);
+      synchronized (this) {
+        this.handle = handle;
+        for (Consumer<Long> update : pendingUpdates) {
+          update.accept(handle);
+        }
+        pendingUpdates.clear();
+      }
       log.info("Native plan for %s:%n%s", taskId, TrinoNative.planString(handle));
       long pages = 0;
       long rows = 0;
@@ -152,7 +189,10 @@ public final class NativeTask {
         input.close();
       }
       if (handle != 0) {
-        TrinoNative.close(handle);
+        synchronized (this) {
+          this.handle = 0;
+          TrinoNative.close(handle);
+        }
       }
     }
   }

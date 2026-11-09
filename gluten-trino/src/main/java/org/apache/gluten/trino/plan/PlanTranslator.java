@@ -23,7 +23,9 @@ import io.substrait.proto.AdvancedExtension;
 import io.substrait.proto.AggregateFunction;
 import io.substrait.proto.AggregateRel;
 import io.substrait.proto.AggregationPhase;
+import io.substrait.proto.ExchangeRel;
 import io.substrait.proto.Expression;
+import io.substrait.proto.ExtensionSingleRel;
 import io.substrait.proto.FetchMode;
 import io.substrait.proto.FetchRel;
 import io.substrait.proto.FilterRel;
@@ -37,6 +39,7 @@ import io.substrait.proto.ReadRel;
 import io.substrait.proto.Rel;
 import io.substrait.proto.RelCommon;
 import io.substrait.proto.RelRoot;
+import io.substrait.proto.SetRel;
 import io.substrait.proto.SortField;
 import io.substrait.proto.SortRel;
 import io.substrait.proto.TopNRel;
@@ -45,9 +48,11 @@ import io.trino.spi.type.Type;
 import io.trino.sql.DynamicFilters;
 import io.trino.sql.ir.IrUtils;
 import io.trino.sql.planner.OrderingScheme;
+import io.trino.sql.planner.PartitioningHandle;
 import io.trino.sql.planner.PlanFragment;
 import io.trino.sql.planner.Symbol;
 import io.trino.sql.planner.plan.AggregationNode;
+import io.trino.sql.planner.plan.AssignUniqueId;
 import io.trino.sql.planner.plan.ExchangeNode;
 import io.trino.sql.planner.plan.FilterNode;
 import io.trino.sql.planner.plan.JoinNode;
@@ -70,6 +75,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static io.trino.sql.planner.SystemPartitioningHandle.FIXED_ARBITRARY_DISTRIBUTION;
+import static io.trino.sql.planner.SystemPartitioningHandle.FIXED_HASH_DISTRIBUTION;
+import static io.trino.sql.planner.SystemPartitioningHandle.FIXED_PASSTHROUGH_DISTRIBUTION;
+import static io.trino.sql.planner.SystemPartitioningHandle.SINGLE_DISTRIBUTION;
+
 /**
  * Translates a Trino plan fragment into a Gluten Substrait plan. Table scans read Hive Parquet
  * files through splits supplied at run time; remote sources become Gluten iterator inputs fed
@@ -77,10 +87,12 @@ import java.util.Set;
  * serializes pages for downstream tasks.
  */
 public final class PlanTranslator {
-  private static final Set<String> SPLITTABLE_AGGREGATES = Set.of("sum", "count", "min", "max", "avg");
+  private static final Set<String> SPLITTABLE_AGGREGATES =
+      Set.of("sum", "count", "min", "max", "avg", "bool_or", "bool_and");
 
   private final FunctionCollector functions = new FunctionCollector();
   private final List<RemoteInput> inputs = new ArrayList<>();
+  private final boolean ucxExchange;
   private Optional<TableScanNode> scan = Optional.empty();
 
   /** A remote source feeding the native task as Gluten input iterator {@code index}. */
@@ -92,10 +104,16 @@ public final class PlanTranslator {
 
   private record Translated(Rel rel, List<Symbol> layout) {}
 
-  private PlanTranslator() {}
+  private PlanTranslator(boolean ucxExchange) {
+    this.ucxExchange = ucxExchange;
+  }
 
-  public static Translation translate(PlanFragment fragment) {
-    PlanTranslator translator = new PlanTranslator();
+  /**
+   * Translates a fragment. With {@code ucxExchange}, remote sources read from upstream native tasks
+   * over the UCX exchange instead of from Trino's exchange.
+   */
+  public static Translation translate(PlanFragment fragment, boolean ucxExchange) {
+    PlanTranslator translator = new PlanTranslator(ucxExchange);
     List<Symbol> outputLayout = fragment.getOutputPartitioningScheme().getOutputLayout();
     Translated root = translator.project(translator.visit(fragment.getRoot()), outputLayout);
 
@@ -129,6 +147,7 @@ public final class PlanTranslator {
       case TopNNode topN -> visitTopN(topN);
       case LimitNode limit -> visitLimit(limit);
       case ValuesNode values -> visitValues(values);
+      case AssignUniqueId assignUniqueId -> visitAssignUniqueId(assignUniqueId);
       default -> throw new UnsupportedPlanException("plan node " + node.getClass().getSimpleName());
     };
   }
@@ -272,7 +291,7 @@ public final class PlanTranslator {
   }
 
   private Translated visitAggregation(AggregationNode node) {
-    if (node.getGroupingSetCount() != 1 || node.getStep() == AggregationNode.Step.INTERMEDIATE
+    if (node.getGroupingSetCount() != 1
         || !node.getPreGroupedSymbols().isEmpty() || node.getGroupIdSymbol().isPresent()) {
       throw new UnsupportedPlanException("aggregation " + node.getStep());
     }
@@ -287,12 +306,18 @@ public final class PlanTranslator {
       grouping.addExpressionReferences(i);
     }
     aggregate.addGroupings(grouping);
+    if (node.getAggregations().isEmpty() && node.getStep() != AggregationNode.Step.FINAL
+        && node.getStep() != AggregationNode.Step.SINGLE) {
+      // Without measures the native side cannot see the step, so mark the aggregation partial.
+      aggregate.setAdvancedExtension(AdvancedExtension.newBuilder()
+          .addOptimization(Any.pack(StringValue.of("allowFlush=1\n"))));
+    }
 
     AggregationPhase phase = switch (node.getStep()) {
       case PARTIAL -> AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_INTERMEDIATE;
       case FINAL -> AggregationPhase.AGGREGATION_PHASE_INTERMEDIATE_TO_RESULT;
       case SINGLE -> AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT;
-      case INTERMEDIATE -> throw new IllegalStateException();
+      case INTERMEDIATE -> AggregationPhase.AGGREGATION_PHASE_INTERMEDIATE_TO_INTERMEDIATE;
     };
     for (Map.Entry<Symbol, AggregationNode.Aggregation> entry : node.getAggregations().entrySet()) {
       AggregationNode.Aggregation aggregation = entry.getValue();
@@ -324,18 +349,66 @@ public final class PlanTranslator {
   }
 
   private Translated visitLocalExchange(ExchangeNode node) {
-    if (node.getScope() != ExchangeNode.Scope.LOCAL || node.getSources().size() != 1) {
-      throw new UnsupportedPlanException("exchange " + node.getScope() + " with " + node.getSources().size() + " sources");
+    if (node.getScope() != ExchangeNode.Scope.LOCAL) {
+      throw new UnsupportedPlanException("exchange " + node.getScope());
     }
-    // A single native driver needs no local exchange, and a local merge of its one sorted stream
-    // keeps the order; the exchange only renames the source's symbols.
-    Translated source = visit(node.getSources().get(0));
-    List<Symbol> renamed = new ArrayList<>(source.layout());
-    List<Symbol> inputs = node.getInputs().get(0);
-    for (int i = 0; i < node.getOutputSymbols().size(); i++) {
-      renamed.set(source.layout().indexOf(inputs.get(i)), node.getOutputSymbols().get(i));
+    List<Translated> sources = new ArrayList<>();
+    for (int s = 0; s < node.getSources().size(); s++) {
+      Translated source = visit(node.getSources().get(s));
+      List<Symbol> renamed = new ArrayList<>(source.layout());
+      List<Symbol> inputs = node.getInputs().get(s);
+      for (int i = 0; i < node.getOutputSymbols().size(); i++) {
+        renamed.set(source.layout().indexOf(inputs.get(i)), node.getOutputSymbols().get(i));
+      }
+      sources.add(project(new Translated(source.rel(), renamed), node.getOutputSymbols()));
     }
-    return project(new Translated(source.rel(), renamed), node.getOutputSymbols());
+    Translated merged = sources.size() == 1 ? sources.get(0) : unionAll(sources, node.getOutputSymbols());
+    if (node.getOrderingScheme().isPresent()) {
+      // The drivers' sorted streams are gathered and sorted again rather than merged.
+      return sort(gather(merged), node.getOrderingScheme().get());
+    }
+    PartitioningHandle handle = node.getPartitioningScheme().getPartitioning().getHandle();
+    if (handle.equals(SINGLE_DISTRIBUTION)) {
+      return sources.size() == 1 ? gather(merged) : merged;
+    }
+    if (handle.equals(FIXED_PASSTHROUGH_DISTRIBUTION)) {
+      return merged;
+    }
+    if (handle.equals(FIXED_ARBITRARY_DISTRIBUTION)) {
+      ExchangeRel exchange = ExchangeRel.newBuilder()
+          .setInput(merged.rel())
+          .setRoundRobin(ExchangeRel.RoundRobin.getDefaultInstance())
+          .build();
+      return new Translated(Rel.newBuilder().setExchange(exchange).build(), merged.layout());
+    }
+    if (handle.equals(FIXED_HASH_DISTRIBUTION)) {
+      ExchangeRel.ScatterFields.Builder fields = ExchangeRel.ScatterFields.newBuilder();
+      for (var argument : node.getPartitioningScheme().getPartitioning().getArguments()) {
+        if (argument.isConstant()) {
+          throw new UnsupportedPlanException("local exchange with constant partitioning argument");
+        }
+        int index = merged.layout().indexOf(argument.getColumn());
+        fields.addFields(ExpressionTranslator.fieldReference(index).getSelection());
+      }
+      ExchangeRel exchange = ExchangeRel.newBuilder().setInput(merged.rel()).setScatterByFields(fields).build();
+      return new Translated(Rel.newBuilder().setExchange(exchange).build(), merged.layout());
+    }
+    throw new UnsupportedPlanException("local exchange " + handle);
+  }
+
+  /** Funnels all drivers of the input pipeline into one. */
+  private static Translated gather(Translated source) {
+    ExchangeRel exchange = ExchangeRel.newBuilder()
+        .setInput(source.rel())
+        .setSingleTarget(ExchangeRel.SingleBucketExpression.getDefaultInstance())
+        .build();
+    return new Translated(Rel.newBuilder().setExchange(exchange).build(), source.layout());
+  }
+
+  private static Translated unionAll(List<Translated> sources, List<Symbol> layout) {
+    SetRel.Builder set = SetRel.newBuilder().setOp(SetRel.SetOp.SET_OP_UNION_ALL);
+    sources.forEach(source -> set.addInputs(source.rel()));
+    return new Translated(Rel.newBuilder().setSet(set).build(), layout);
   }
 
   private Translated visitValues(ValuesNode node) {
@@ -369,6 +442,21 @@ public final class PlanTranslator {
         .setVirtualTable(table)
         .build();
     return new Translated(Rel.newBuilder().setRead(read).build(), outputs);
+  }
+
+  // Substrait has no unique-id relation, so the native side reads this extension as Velox's
+  // AssignUniqueIdNode, which appends a bigint id column.
+  private Translated visitAssignUniqueId(AssignUniqueId node) {
+    Translated source = visit(node.getSource());
+    ExtensionSingleRel extension = ExtensionSingleRel.newBuilder()
+        .setInput(source.rel())
+        .setDetail(Any.pack(StringValue.of("AssignUniqueId")))
+        .build();
+    List<Symbol> layout = ImmutableList.<Symbol>builder()
+        .addAll(source.layout())
+        .add(node.getIdColumn())
+        .build();
+    return new Translated(Rel.newBuilder().setExtensionSingle(extension).build(), layout);
   }
 
   private Translated visitTopN(TopNNode node) {
@@ -423,7 +511,7 @@ public final class PlanTranslator {
   private Translated visitRemoteSource(RemoteSourceNode node) {
     Translated read = readRemoteSource(node);
     // Pages from the upstream tasks arrive interleaved through one input, so a merge becomes a sort.
-    return node.getOrderingScheme().map(ordering -> sort(read, ordering)).orElse(read);
+    return node.getOrderingScheme().map(ordering -> sort(gather(read), ordering)).orElse(read);
   }
 
   private Translated readRemoteSource(RemoteSourceNode node) {
@@ -437,7 +525,7 @@ public final class PlanTranslator {
     ReadRel read = ReadRel.newBuilder()
         .setBaseSchema(TypeTranslator.namedStruct(names, types))
         .setLocalFiles(ReadRel.LocalFiles.newBuilder()
-            .addItems(ReadRel.LocalFiles.FileOrFiles.newBuilder().setUriFile("iterator:" + index)))
+            .addItems(ReadRel.LocalFiles.FileOrFiles.newBuilder().setUriFile((ucxExchange ? "ucx:" : "iterator:") + index)))
         .build();
     return new Translated(Rel.newBuilder().setRead(read).build(), node.getOutputSymbols());
   }

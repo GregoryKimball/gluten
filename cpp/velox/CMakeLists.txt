@@ -685,6 +685,14 @@ if(ENABLE_GPU)
            facebook::velox::velox_cudf_expression_registry
            cudf::cudf
            velox_curl)
+
+  # velox_cudf_exec embeds the UCX exchange objects but not their shared
+  # library dependencies.
+  if(EXISTS ${VELOX_BUILD_PATH}/_deps/ucxx-build/ucxx-config.cmake)
+    set(ucxx_DIR "${VELOX_BUILD_PATH}/_deps/ucxx-build")
+    find_package(ucxx CONFIG REQUIRED)
+    target_link_libraries(gluten_velox_impl PUBLIC ucxx::ucxx)
+  endif()
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")

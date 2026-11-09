@@ -17,6 +17,9 @@
 #pragma once
 
 #include <folly/Executor.h>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include "compute/Runtime.h"
 #include "compute/VeloxConnectorIds.h"
 #include "iceberg/IcebergPlanConverter.h"
@@ -59,6 +62,7 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
       }
       auto deletionFuture = task_->taskDeletionFuture();
       cursor_.reset();
+      parallelTask_.reset();
       task_ = nullptr;
       deletionFuture.wait();
     }
@@ -100,7 +104,28 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   /// @see https://facebookincubator.github.io/velox/develop/task-barrier.html
   void requestBarrier() override;
 
+  /// Adds a remote split reading 'url' to the exchange 'nodeId'. Parallel tasks only.
+  void addRemoteSplit(const facebook::velox::core::PlanNodeId& nodeId, const std::string& url);
+
+  /// Ends the remote splits of the exchange 'nodeId'. Parallel tasks only.
+  void noMoreRemoteSplits(const facebook::velox::core::PlanNodeId& nodeId);
+
+  /// Sets the destination count of a broadcast or arbitrary partitioned output.
+  void updateOutputBuffers(int numBuffers, bool noMoreBuffers);
+
  private:
+  /// Runs the plan as a parallel Velox task named 'taskId', as tasks with exchanges and
+  /// partitioned outputs require. Output not sent through a partitioned output is queued for next().
+  void startParallelTask(const std::string& taskId, const std::string& spillDir);
+
+  std::shared_ptr<ColumnarBatch> nextParallel();
+
+  /// Wraps the plan in the partitioned output described by 'spec', or returns it unchanged when
+  /// 'spec' is empty.
+  static std::shared_ptr<const facebook::velox::core::PlanNode> addPartitionedOutput(
+      const std::shared_ptr<const facebook::velox::core::PlanNode>& planNode,
+      const std::string& spec);
+
   /// Get the Spark confs to Velox query context.
   std::unordered_map<std::string, std::string> getQueryContextConf();
 
@@ -155,6 +180,14 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   std::vector<facebook::velox::core::PlanNodeId> streamIds_;
   std::vector<std::vector<facebook::velox::exec::Split>> splits_;
   bool allSplitsAdded_ = false;
+
+  /// Parallel execution.
+  std::shared_ptr<facebook::velox::exec::Task> parallelTask_;
+  bool parallelStatsLogged_{false};
+  std::mutex outputMutex_;
+  std::condition_variable outputCv_;
+  std::deque<facebook::velox::RowVectorPtr> outputs_;
+  std::vector<facebook::velox::ContinuePromise> outputPromises_;
 
   int64_t loadLazyVectorTime_ = 0;
 };

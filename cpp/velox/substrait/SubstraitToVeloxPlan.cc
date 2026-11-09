@@ -34,7 +34,11 @@
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/connectors/hive/iceberg/IcebergColumnHandle.h"
 #include "velox/connectors/hive/iceberg/IcebergTableHandle.h"
+#include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/TableWriter.h"
+#include "velox/expression/Expr.h"
+#include "velox/expression/ExprToSubfieldFilter.h"
 #include "velox/type/Type.h"
 
 #include "utils/ConfigExtractor.h"
@@ -261,6 +265,98 @@ bool hasMatchingReturnType(const exec::CompanionSignatureEntry& entry, const Typ
   return false;
 }
 
+// Trino plans call the Presto functions under this prefix (see TrinoJniWrapper.cc).
+const std::string kTrinoFunctionPrefix = "presto.";
+
+void flattenConjuncts(const core::TypedExprPtr& expr, std::vector<core::TypedExprPtr>& conjuncts) {
+  if (auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(expr); call && call->name() == "and") {
+    for (const auto& input : call->inputs()) {
+      flattenConjuncts(input, conjuncts);
+    }
+    return;
+  }
+  conjuncts.push_back(expr);
+}
+
+// Returns 'conjunct' as a call the Presto subfield filter parser accepts: unprefixed name, field on the left,
+// and constants of exactly the field's type, so decimal scales never differ.
+std::shared_ptr<const core::CallTypedExpr> toPrestoFilterCall(const core::TypedExprPtr& conjunct) {
+  static const std::unordered_map<std::string, std::string> kFlipped = {
+      {"eq", "eq"}, {"neq", "neq"}, {"lt", "gt"}, {"lte", "gte"}, {"gt", "lt"}, {"gte", "lte"}};
+  auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(conjunct);
+  if (call == nullptr || call->name().rfind(kTrinoFunctionPrefix, 0) != 0) {
+    return nullptr;
+  }
+  auto name = call->name().substr(kTrinoFunctionPrefix.size());
+  auto inputs = call->inputs();
+  if (inputs.empty() || !inputs[0]->type()->equivalent(*inputs.back()->type())) {
+    return nullptr;
+  }
+  for (const auto& input : inputs) {
+    if (!input->type()->equivalent(*inputs[0]->type())) {
+      return nullptr;
+    }
+  }
+  auto isField = [](const core::TypedExprPtr& expr) {
+    auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
+    return field != nullptr && field->isInputColumn();
+  };
+  auto isConstant = [](const core::TypedExprPtr& expr) {
+    return std::dynamic_pointer_cast<const core::ConstantTypedExpr>(expr) != nullptr;
+  };
+  if (kFlipped.count(name) && inputs.size() == 2) {
+    if (isConstant(inputs[0]) && isField(inputs[1])) {
+      name = kFlipped.at(name);
+      std::swap(inputs[0], inputs[1]);
+    }
+    if (!isField(inputs[0]) || !isConstant(inputs[1])) {
+      return nullptr;
+    }
+  } else if (name == "between" && inputs.size() == 3) {
+    if (!isField(inputs[0]) || !isConstant(inputs[1]) || !isConstant(inputs[2])) {
+      return nullptr;
+    }
+  } else {
+    return nullptr;
+  }
+  return std::make_shared<core::CallTypedExpr>(call->type(), std::move(inputs), name);
+}
+
+// Moves comparisons of a column with constants from 'filter' into 'subfieldFilters'. cuDF scans apply those
+// while reading; the remaining filter must compile to a cuDF expression, which decimal comparisons do not.
+core::TypedExprPtr extractSubfieldFilters(
+    const core::TypedExprPtr& filter,
+    common::SubfieldFilters& subfieldFilters,
+    memory::MemoryPool* pool) {
+  std::vector<core::TypedExprPtr> conjuncts;
+  flattenConjuncts(filter, conjuncts);
+  auto queryCtx = core::QueryCtx::create();
+  exec::SimpleExpressionEvaluator evaluator(queryCtx.get(), pool);
+  exec::PrestoExprToSubfieldFilterParser parser;
+  std::vector<core::TypedExprPtr> remaining;
+  for (const auto& conjunct : conjuncts) {
+    auto call = toPrestoFilterCall(conjunct);
+    auto result = call ? parser.leafCallToSubfieldFilter(*call, &evaluator) : std::nullopt;
+    if (!result.has_value()) {
+      remaining.push_back(conjunct);
+      continue;
+    }
+    auto& [subfield, subfieldFilter] = *result;
+    if (auto it = subfieldFilters.find(subfield); it != subfieldFilters.end()) {
+      it->second = it->second->mergeWith(subfieldFilter.get());
+    } else {
+      subfieldFilters.emplace(std::move(subfield), std::move(subfieldFilter));
+    }
+  }
+  if (remaining.empty()) {
+    return nullptr;
+  }
+  if (remaining.size() == 1) {
+    return remaining[0];
+  }
+  return std::make_shared<core::CallTypedExpr>(BOOLEAN(), std::move(remaining), "and");
+}
+
 } // namespace
 
 bool SplitInfo::canUseCudfConnector() {
@@ -297,6 +393,15 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::processEmit(
 }
 
 core::AggregationNode::Step SubstraitToVeloxPlanConverter::toAggregationStep(const ::substrait::AggregateRel& aggRel) {
+  // Presto plans split aggregations into steps, which cuDF runs incrementally; Spark's
+  // companion functions under a single step would make cuDF buffer all input.
+  if (prestoDialect_ && !aggRel.measures().empty()) {
+    const auto step = toAggregationFunctionStep(aggRel.measures(0).measure());
+    for (const auto& measure : aggRel.measures()) {
+      VELOX_CHECK(toAggregationFunctionStep(measure.measure()) == step, "Aggregation mixes steps");
+    }
+    return step;
+  }
   // TODO Simplify Velox's aggregation steps
   if (aggRel.has_advanced_extension() &&
       SubstraitParser::configSetInOptimization(aggRel.advanced_extension(), "allowFlush=")) {
@@ -622,7 +727,9 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
 
     auto aggVeloxType = SubstraitParser::parseType(aggFunction.output_type());
     auto baseFuncName = SubstraitParser::findVeloxFunction(functionMap_, aggFunction.function_reference());
-    auto funcName = toAggregationFunctionName(baseFuncName, toAggregationFunctionStep(aggFunction), aggVeloxType);
+    auto funcName = prestoDialect_
+        ? baseFuncName
+        : toAggregationFunctionName(baseFuncName, toAggregationFunctionStep(aggFunction), aggVeloxType);
 
     auto aggExpr = std::make_shared<const core::CallTypedExpr>(aggVeloxType, std::move(aggParams), funcName);
     std::vector<TypePtr> rawInputTypes =
@@ -1372,6 +1479,42 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   }
 }
 
+core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::ExchangeRel& exchangeRel) {
+  GLUTEN_CHECK(exchangeRel.has_input(), "Input is expected in ExchangeRel.");
+  auto childNode = toVeloxPlan(exchangeRel.input());
+  if (exchangeRel.has_single_target()) {
+    return std::make_shared<core::LocalPartitionNode>(
+        nextPlanNodeId(),
+        core::LocalPartitionNode::Type::kGather,
+        false,
+        std::make_shared<core::GatherPartitionFunctionSpec>(),
+        std::vector<core::PlanNodePtr>{childNode});
+  }
+  core::PartitionFunctionSpecPtr partitionFunctionSpec;
+  if (exchangeRel.has_round_robin()) {
+    partitionFunctionSpec = std::make_shared<exec::RoundRobinPartitionFunctionSpec>();
+  } else if (exchangeRel.has_scatter_by_fields()) {
+    std::vector<column_index_t> keyChannels;
+    for (const auto& field : exchangeRel.scatter_by_fields().fields()) {
+      uint32_t index;
+      GLUTEN_CHECK(
+          SubstraitParser::parseReferenceSegment(field.direct_reference(), index),
+          "Unsupported ExchangeRel scatter field.");
+      keyChannels.push_back(index);
+    }
+    partitionFunctionSpec =
+        std::make_shared<exec::HashPartitionFunctionSpec>(asRowType(childNode->outputType()), std::move(keyChannels));
+  } else {
+    VELOX_NYI("Unsupported ExchangeRel kind.");
+  }
+  return std::make_shared<core::LocalPartitionNode>(
+      nextPlanNodeId(),
+      core::LocalPartitionNode::Type::kRepartition,
+      false,
+      std::move(partitionFunctionSpec),
+      std::vector<core::PlanNodePtr>{childNode});
+}
+
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::SortRel& sortRel) {
   auto childNode = convertSingleInput<::substrait::SortRel>(sortRel);
   auto [sortingKeys, sortingOrders] = processSortField(sortRel.sorts(), childNode->outputType());
@@ -1438,6 +1581,32 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   auto [sortingKeys, sortingOrders] = processSortField(topNRel.sorts(), childNode->outputType());
   return std::make_shared<core::TopNNode>(
       nextPlanNodeId(), sortingKeys, sortingOrders, count.value(), false /*isPartial*/, childNode);
+}
+
+core::PlanNodePtr SubstraitToVeloxPlanConverter::constructUcxExchangeNode(const ::substrait::ReadRel& readRel) {
+  if (!readRel.has_local_files() || readRel.local_files().items_size() != 1) {
+    return nullptr;
+  }
+  const std::string& uri = readRel.local_files().items(0).uri_file();
+  constexpr std::string_view kPrefix = "ucx:";
+  if (uri.rfind(kPrefix, 0) != 0) {
+    return nullptr;
+  }
+  const auto nodeId = ucxExchangeNodeId(std::stoi(uri.substr(kPrefix.size())));
+  auto types = SubstraitParser::parseNamedStruct(readRel.base_schema());
+  std::vector<std::string> names;
+  names.reserve(types.size());
+  for (size_t i = 0; i < types.size(); ++i) {
+    names.emplace_back(fmt::format("{}_{}", nodeId, i));
+  }
+  auto splitInfo = std::make_shared<SplitInfo>();
+  splitInfo->leafType = SplitInfo::LeafType::TRIVIAL_LEAF;
+  splitInfoMap_[nodeId] = splitInfo;
+  return std::make_shared<core::ExchangeNode>(
+      nodeId,
+      ROW(std::move(names), std::move(types)),
+      VectorSerde::kindName(VectorSerde::Kind::kPresto),
+      std::string{core::TransportKind::kUcx});
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::constructValueStreamNode(
@@ -1608,6 +1777,10 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   }
 #endif
 
+  if (auto exchangeNode = constructUcxExchangeNode(readRel)) {
+    return exchangeNode;
+  }
+
   auto streamIdx = getStreamIndex(readRel);
   if (streamIdx >= 0) {
     // Check if the ReadRel specifies an input of stream. If yes, build TableScanNode with iterator connector.
@@ -1719,6 +1892,9 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
 #endif
   }
   common::SubfieldFilters subfieldFilters;
+  if (prestoDialect_ && remainingFilter != nullptr) {
+    remainingFilter = extractSubfieldFilters(remainingFilter, subfieldFilters, pool_);
+  }
   if (connectorId == connectorIds_.iceberg) {
     // The Iceberg connector's data source requires an IcebergTableHandle.
     tableHandle = std::make_shared<connector::hive::iceberg::IcebergTableHandle>(
@@ -1934,9 +2110,22 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     return toVeloxPlan(rel.windowgrouplimit());
   } else if (rel.has_set()) {
     return toVeloxPlan(rel.set());
+  } else if (rel.has_exchange()) {
+    return toVeloxPlan(rel.exchange());
+  } else if (rel.has_extension_single()) {
+    return toVeloxPlan(rel.extension_single());
   } else {
     VELOX_NYI("Substrait conversion not supported for Rel.");
   }
+}
+
+core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::ExtensionSingleRel& extensionRel) {
+  google::protobuf::StringValue detail;
+  VELOX_CHECK(extensionRel.detail().UnpackTo(&detail), "ExtensionSingleRel detail is not a string.");
+  VELOX_CHECK_EQ(detail.value(), "AssignUniqueId", "Unsupported ExtensionSingleRel.");
+  auto childNode = toVeloxPlan(extensionRel.input());
+  auto idName = SubstraitParser::makeNodeName(planNodeId_, 0);
+  return std::make_shared<core::AssignUniqueIdNode>(nextPlanNodeId(), idName, std::move(childNode));
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::RelRoot& root) {

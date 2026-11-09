@@ -119,6 +119,12 @@ const std::string kDebugCudf = "spark.gluten.sql.debug.cudf";
 const std::string kDebugCudfDefault = "false";
 const std::string kCudfAllowCpuFallback = "spark.gluten.sql.columnar.backend.velox.cudf.allowCpuFallback";
 const std::string kCudfAllowCpuFallbackDefault = "true";
+const std::string kCudfExchange = "spark.gluten.sql.columnar.backend.velox.cudf.exchange";
+const std::string kCudfExchangeDefault = "false";
+const std::string kCudfUcxxErrorHandling = "spark.gluten.sql.columnar.backend.velox.cudf.ucxx.errorHandling";
+const std::string kCudfUcxxErrorHandlingDefault = "true";
+const std::string kCudfUcxxBlockingProgress = "spark.gluten.sql.columnar.backend.velox.cudf.ucxx.blockingProgress";
+const std::string kCudfUcxxBlockingProgressDefault = "true";
 
 std::unordered_map<std::string, std::string>
 parseConfMap(JNIEnv* env, const uint8_t* planData, const int32_t planDataLength);

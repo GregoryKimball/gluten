@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +34,7 @@
 #include "compute/ResultIterator.h"
 #include "compute/Runtime.h"
 #include "compute/VeloxBackend.h"
+#include "compute/WholeStageResultIterator.h"
 #include "config/GlutenConfig.h"
 #include "config/VeloxConfig.h"
 #include "memory/AllocationListener.h"
@@ -40,6 +42,7 @@
 #include "memory/VeloxColumnarBatch.h"
 #include "memory/VeloxMemoryManager.h"
 #include "substrait/SubstraitParser.h"
+#include "substrait/SubstraitToVeloxPlan.h"
 #include "substrait/type.pb.h"
 #include "threads/ThreadInitializer.h"
 #include "threads/ThreadManager.h"
@@ -51,6 +54,7 @@
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
 #endif
 
 using namespace facebook::velox;
@@ -61,6 +65,10 @@ namespace {
 // Gluten registers Spark functions without a prefix. Trino plans call the
 // Presto functions, whose semantics match Trino's, under this prefix.
 const std::string kPrestoPrefix = "presto.";
+
+// The UCX exchange listens on this port; peers derive it from the worker's HTTP port plus 3.
+const std::string kUcxPort = "spark.gluten.trino.ucx.port";
+constexpr uint16_t kUcxPortDefault = 8084;
 
 JavaVM* gVm = nullptr;
 jclass gRuntimeExceptionClass = nullptr;
@@ -191,6 +199,14 @@ TrinoTask* toTask(jlong handle) {
   return reinterpret_cast<TrinoTask*>(handle);
 }
 
+WholeStageResultIterator* wholeStageIterator(TrinoTask* task) {
+  auto* iterator = dynamic_cast<WholeStageResultIterator*>(task->iterator->getInputIter());
+  if (iterator == nullptr) {
+    throw GlutenException("Native task is not a whole stage task");
+  }
+  return iterator;
+}
+
 void throwJava(JNIEnv* env, const std::string& message) {
   env->ThrowNew(gRuntimeExceptionClass, message.c_str());
 }
@@ -248,6 +264,17 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_initialize( 
     cudf_velox::registerPrestoFunctions(kPrestoPrefix);
     cudf_velox::registerPrestoAggregateFunctions(kPrestoPrefix);
   }
+  if (cudf_velox::CudfConfig::getInstance().exchange) {
+    const auto port = VeloxBackend::get()->getBackendConf()->get<uint16_t>(kUcxPort, kUcxPortDefault);
+    ContinueFuture started;
+    auto communicator = ucx_exchange::Communicator::initAndGet(port, "", &started);
+    if (communicator == nullptr) {
+      throw GlutenException("Unable to start the UCX communicator on port " + std::to_string(port));
+    }
+    std::thread(&ucx_exchange::Communicator::run, communicator.get()).detach();
+    started.wait();
+    LOG(INFO) << "UCX communicator listening on port " << port;
+  }
 #endif
   TRINO_JNI_END()
 }
@@ -293,6 +320,7 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_createTask(
   }
 
   task->iterator = task->runtime->createResultIterator(toString(env, spillDir), inputs);
+  task->runtime->noMoreSplits(task->iterator.get());
   return reinterpret_cast<jlong>(task.release());
   TRINO_JNI_END(0)
 }
@@ -330,6 +358,38 @@ JNIEXPORT jbyteArray JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_next( 
   env->SetByteArrayRegion(result, 0, task->page.size(), reinterpret_cast<const jbyte*>(task->page.data()));
   return result;
   TRINO_JNI_END(nullptr)
+}
+
+// Adds a remote task's result location to the UCX exchange that reads plan input 'inputIndex'.
+JNIEXPORT void JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_addRemoteSplit( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jint inputIndex,
+    jstring location) {
+  TRINO_JNI_START
+  wholeStageIterator(toTask(handle))->addRemoteSplit(ucxExchangeNodeId(inputIndex), toString(env, location));
+  TRINO_JNI_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_noMoreRemoteSplits( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jint inputIndex) {
+  TRINO_JNI_START
+  wholeStageIterator(toTask(handle))->noMoreRemoteSplits(ucxExchangeNodeId(inputIndex));
+  TRINO_JNI_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_noMoreOutputBuffers( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jint numBuffers) {
+  TRINO_JNI_START
+  wholeStageIterator(toTask(handle))->updateOutputBuffers(numBuffers, true);
+  TRINO_JNI_END()
 }
 
 JNIEXPORT void JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_close( // NOLINT

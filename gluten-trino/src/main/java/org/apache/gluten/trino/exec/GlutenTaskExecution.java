@@ -18,37 +18,49 @@ package org.apache.gluten.trino.exec;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import io.trino.exchange.DirectExchangeInput;
 import io.trino.execution.ScheduledSplit;
 import io.trino.execution.SplitAssignment;
 import io.trino.execution.SqlTaskExecution;
 import io.trino.execution.TaskExecution;
 import io.trino.metadata.Split;
 import io.trino.operator.TaskContext;
+import io.trino.split.RemoteSplit;
 import io.trino.sql.planner.plan.PlanNodeId;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
 /**
  * Runs a fragment natively. Remote-source splits go to the wrapped {@link SqlTaskExecution},
  * whose exchange pipelines feed the native task; table-scan splits are collected here and handed
- * to the native task once the coordinator has sent all of them.
+ * to the native task once the coordinator has sent all of them. With the UCX exchange, remote-source
+ * splits also go to the native task, which fetches their data over UCX.
  */
 public final class GlutenTaskExecution implements TaskExecution {
   private final SqlTaskExecution delegate;
   private final NativeTask nativeTask;
   private final Optional<PlanNodeId> scanNode;
+  private final Map<PlanNodeId, Integer> ucxInputs;
+  private final Set<String> seenRemoteSplits = new HashSet<>();
+  private final Set<PlanNodeId> noMoreRemoteSplits = new HashSet<>();
   private final Set<Long> seenSequenceIds = new HashSet<>();
   private final List<Split> scanSplits = new ArrayList<>();
   private boolean noMoreScanSplits;
 
-  public GlutenTaskExecution(SqlTaskExecution delegate, NativeTask nativeTask, Optional<PlanNodeId> scanNode) {
+  public GlutenTaskExecution(
+      SqlTaskExecution delegate,
+      NativeTask nativeTask,
+      Optional<PlanNodeId> scanNode,
+      Map<PlanNodeId, Integer> ucxInputs) {
     this.delegate = delegate;
     this.nativeTask = nativeTask;
     this.scanNode = scanNode;
+    this.ucxInputs = Map.copyOf(ucxInputs);
   }
 
   @Override
@@ -72,6 +84,10 @@ public final class GlutenTaskExecution implements TaskExecution {
       for (SplitAssignment assignment : splitAssignments) {
         if (!scanNode.map(assignment.getPlanNodeId()::equals).orElse(false)) {
           remote.add(assignment);
+          Integer input = ucxInputs.get(assignment.getPlanNodeId());
+          if (input != null) {
+            addUcxSplits(input, assignment);
+          }
           continue;
         }
         if (noMoreScanSplits) {
@@ -94,6 +110,22 @@ public final class GlutenTaskExecution implements TaskExecution {
     }
     if (startNative) {
       nativeTask.start(ImmutableList.copyOf(scanSplits));
+    }
+  }
+
+  private void addUcxSplits(int input, SplitAssignment assignment) {
+    if (noMoreRemoteSplits.contains(assignment.getPlanNodeId())) {
+      return;
+    }
+    for (ScheduledSplit split : assignment.getSplits()) {
+      if (seenRemoteSplits.add(assignment.getPlanNodeId() + ":" + split.sequenceId())) {
+        RemoteSplit remoteSplit = (RemoteSplit) split.split().getConnectorSplit();
+        nativeTask.addRemoteSplit(input, ((DirectExchangeInput) remoteSplit.getExchangeInput()).getLocation());
+      }
+    }
+    if (assignment.isNoMoreSplits()) {
+      noMoreRemoteSplits.add(assignment.getPlanNodeId());
+      nativeTask.noMoreRemoteSplits(input);
     }
   }
 

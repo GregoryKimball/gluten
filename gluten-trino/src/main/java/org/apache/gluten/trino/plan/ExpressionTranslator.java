@@ -165,6 +165,16 @@ public final class ExpressionTranslator {
     if (functionName.equals("$like")) {
       return translateLike(call);
     }
+    if (functionName.equals("$divide_round_to_scale")) {
+      // Presto's decimal divide keeps the dividend's scale when the divisor has scale 0, and rounds
+      // HALF_UP like Trino.
+      Expression divisor = cast(translate(call.arguments().get(1)), DecimalType.createDecimalType(19, 0));
+      return decimalCall("divide", call.type(), translate(call.arguments().get(0)),
+          (DecimalType) call.arguments().get(0).type(), divisor, DecimalType.createDecimalType(19, 0));
+    }
+    if (functionName.equals("$operator$divide") && call.type() instanceof DecimalType result) {
+      return translateDecimalDivide(call, result);
+    }
     String velox = OPERATORS.get(functionName);
     if (velox == null && FUNCTIONS.contains(functionName)) {
       velox = functionName;
@@ -173,6 +183,51 @@ public final class ExpressionTranslator {
       throw new UnsupportedPlanException("function " + functionName);
     }
     return scalar(velox, call.type(), call.arguments());
+  }
+
+  // Trino widens the quotient's scale (to at least 6), while Presto's divide returns
+  // max(dividend scale, divisor scale). Rescaling the dividend to Trino's result scale makes
+  // Presto's quotient carry that scale with the same HALF_UP rounding.
+  private Expression translateDecimalDivide(Call call, DecimalType result) {
+    DecimalType dividendType = (DecimalType) call.arguments().get(0).type();
+    DecimalType divisorType = (DecimalType) call.arguments().get(1).type();
+    if (divisorType.getScale() > result.getScale()) {
+      throw new UnsupportedPlanException("decimal divide by " + divisorType + " into " + result);
+    }
+    Expression dividend = translate(call.arguments().get(0));
+    if (dividendType.getScale() != result.getScale()) {
+      dividendType = DecimalType.createDecimalType(38, result.getScale());
+      dividend = cast(dividend, dividendType);
+    }
+    DecimalType quotient = DecimalType.createDecimalType(
+        Math.min(38, dividendType.getPrecision() + divisorType.getScale()
+            + Math.max(0, divisorType.getScale() - dividendType.getScale())),
+        result.getScale());
+    Expression divide = decimalCall("divide", quotient, dividend, dividendType,
+        translate(call.arguments().get(1)), divisorType);
+    return quotient.equals(result) ? divide : cast(divide, result);
+  }
+
+  private Expression decimalCall(
+      String name, Type outputType, Expression left, DecimalType leftType, Expression right, DecimalType rightType) {
+    String signature = PRESTO_PREFIX + name + ":" + TypeTranslator.signatureName(leftType)
+        + "_" + TypeTranslator.signatureName(rightType);
+    return Expression.newBuilder()
+        .setScalarFunction(Expression.ScalarFunction.newBuilder()
+            .setFunctionReference(functions.anchor(signature))
+            .setOutputType(TypeTranslator.toSubstrait(outputType))
+            .addArguments(FunctionArgument.newBuilder().setValue(left))
+            .addArguments(FunctionArgument.newBuilder().setValue(right)))
+        .build();
+  }
+
+  private static Expression cast(Expression input, Type target) {
+    return Expression.newBuilder()
+        .setCast(Expression.Cast.newBuilder()
+            .setType(TypeTranslator.toSubstrait(target))
+            .setInput(input)
+            .setFailureBehavior(Expression.Cast.FailureBehavior.FAILURE_BEHAVIOR_THROW_EXCEPTION))
+        .build();
   }
 
   // Trino folds the pattern into a compiled LikePattern constant; Velox's like takes the pattern

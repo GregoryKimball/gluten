@@ -144,6 +144,77 @@ public final class NativeOperators {
     }
   }
 
+  /**
+   * Ends a remote source whose data the native task reads over the UCX exchange. Trino's exchange
+   * still runs so that upstream tasks see their (empty) output buffers consumed and finish.
+   */
+  public static final class DrainSinkFactory implements OperatorFactory {
+    private final int operatorId;
+    private final PlanNodeId planNodeId;
+
+    public DrainSinkFactory(int operatorId, PlanNodeId planNodeId) {
+      this.operatorId = operatorId;
+      this.planNodeId = planNodeId;
+    }
+
+    @Override
+    public Operator createOperator(DriverContext driverContext) {
+      return new DrainSink(driverContext.addOperatorContext(operatorId, planNodeId, DrainSink.class.getSimpleName()));
+    }
+
+    @Override
+    public void noMoreOperators() {}
+
+    @Override
+    public OperatorFactory duplicate() {
+      throw new UnsupportedOperationException();
+    }
+  }
+
+  private static final class DrainSink implements Operator {
+    private final OperatorContext context;
+    private boolean finished;
+
+    DrainSink(OperatorContext context) {
+      this.context = context;
+    }
+
+    @Override
+    public OperatorContext getOperatorContext() {
+      return context;
+    }
+
+    @Override
+    public boolean needsInput() {
+      return !finished;
+    }
+
+    @Override
+    public void addInput(Page page) {
+      if (page.getPositionCount() > 0) {
+        throw new IllegalStateException("Upstream native task sent " + page.getPositionCount() + " rows through Trino's exchange");
+      }
+    }
+
+    @Override
+    public Page getOutput() {
+      return null;
+    }
+
+    @Override
+    public void finish() {
+      finished = true;
+    }
+
+    @Override
+    public boolean isFinished() {
+      return finished;
+    }
+
+    @Override
+    public void close() {}
+  }
+
   private static final class InputSink implements Operator {
     private final OperatorContext context;
     private final NativeTask task;

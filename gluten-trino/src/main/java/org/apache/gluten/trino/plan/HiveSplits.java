@@ -16,6 +16,8 @@
  */
 package org.apache.gluten.trino.plan;
 
+import com.google.protobuf.Any;
+import com.google.protobuf.StringValue;
 import io.substrait.proto.ReadRel;
 import io.trino.metadata.Split;
 import io.trino.spi.connector.ColumnHandle;
@@ -86,6 +88,11 @@ public final class HiveSplits {
             ReadRel.LocalFiles.FileOrFiles.fileProperties.newBuilder()
                 .setFileSize((Long) invoke(hiveSplit, "getEstimatedFileSize"))
                 .setModificationTime((Long) invoke(hiveSplit, "getFileModifiedTime")))
+        // Hive maps Parquet columns by name; Velox defaults to position.
+        .addOtherConstMetadataColumns(
+            ReadRel.LocalFiles.FileOrFiles.otherConstantMetadataColumnValues.newBuilder()
+                .setKey("__gluten.column_mapping_mode")
+                .setValue(Any.pack(StringValue.of("NAME"))))
         .build();
   }
 

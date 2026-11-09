@@ -28,6 +28,7 @@ public class GlutenTrinoConfig {
   private boolean enabled = true;
   private String libraryPath = "/usr/lib/gluten/libgluten_trino.so";
   private boolean cudfEnabled = true;
+  private boolean ucxExchangeEnabled;
   private String spillDir = "/tmp/gluten-spill";
   private DataSize queueSize = DataSize.of(64, DataSize.Unit.MEGABYTE);
   private Map<String, String> nativeConf = ImmutableMap.of();
@@ -60,6 +61,17 @@ public class GlutenTrinoConfig {
   @Config("gluten.cudf.enabled")
   public GlutenTrinoConfig setCudfEnabled(boolean cudfEnabled) {
     this.cudfEnabled = cudfEnabled;
+    return this;
+  }
+
+  public boolean isUcxExchangeEnabled() {
+    return ucxExchangeEnabled;
+  }
+
+  @Config("gluten.ucx-exchange.enabled")
+  @ConfigDescription("Move data between native tasks over the cuDF UCX exchange; Trino's exchange carries only control")
+  public GlutenTrinoConfig setUcxExchangeEnabled(boolean ucxExchangeEnabled) {
+    this.ucxExchangeEnabled = ucxExchangeEnabled;
     return this;
   }
 

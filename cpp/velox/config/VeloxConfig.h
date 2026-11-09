@@ -166,6 +166,7 @@ const std::string kVeloxSsdCheckSumReadVerificationEnabled =
 // async
 const std::string kNumTaskSlotsPerExecutor = "spark.gluten.numTaskSlotsPerExecutor";
 const std::string kVeloxIOThreads = "spark.gluten.sql.columnar.backend.velox.IOThreads";
+const std::string kVeloxTaskThreads = "spark.gluten.sql.columnar.backend.velox.taskThreads";
 
 // Function and aggregation semantics of the Substrait plan: "spark" (default) or "presto".
 const std::string kSubstraitDialect = "spark.gluten.sql.columnar.backend.velox.substrait.dialect";

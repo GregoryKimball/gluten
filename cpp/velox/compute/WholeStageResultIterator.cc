@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 #include "WholeStageResultIterator.h"
+#include <folly/Conv.h>
+#include <folly/String.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/json.h>
@@ -34,6 +36,9 @@
 #ifdef ENABLE_KAFKA
 #include "operators/reader/KafkaSplitInfo.h"
 #endif
+#include "velox/exec/Exchange.h"
+#include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/functions/sparksql/SparkQueryConfig.h"
 #ifdef GLUTEN_ENABLE_GPU
@@ -55,6 +60,13 @@ namespace {
 // others
 const std::string kHiveDefaultPartition = "__HIVE_DEFAULT_PARTITION__";
 const std::string kDeltaTableFormat = "delta";
+
+// A task id runs the plan as a parallel Velox task under that id, which remote exchanges use to
+// address it; the partitioned output spec is described at addPartitionedOutput().
+const std::string kParallelTaskId = "spark.gluten.trino.taskId";
+const std::string kParallelPartitionedOutput = "spark.gluten.trino.partitionedOutput";
+const std::string kParallelMaxDrivers = "spark.gluten.trino.maxDrivers";
+constexpr size_t kMaxQueuedOutputs = 16;
 
 const velox::core::TableScanNode* findTableScanNodeById(
     const std::shared_ptr<const velox::core::PlanNode>& planNode,
@@ -83,6 +95,17 @@ std::string connectorIdForScanNode(
     return "";
   }
   return tableScanNode->tableHandle()->connectorId();
+}
+
+// Trino task ids end in <partition>.<attempt>, and the partition numbers the tasks of a stage.
+std::optional<int32_t> taskPartition(const std::string& taskId) {
+  std::vector<folly::StringPiece> parts;
+  folly::split('.', taskId, parts);
+  if (parts.size() < 2) {
+    return std::nullopt;
+  }
+  auto partition = folly::tryTo<int32_t>(parts[parts.size() - 2]);
+  return partition.hasValue() ? std::optional<int32_t>(partition.value()) : std::nullopt;
 }
 
 } // namespace
@@ -120,25 +143,30 @@ WholeStageResultIterator::WholeStageResultIterator(
   GLUTEN_CHECK(fileSystem != nullptr, "File System for spilling is null!");
   fileSystem->mkdir(spillDir);
 
-  std::unordered_set<velox::core::PlanNodeId> emptySet;
-  const bool serialExecution = true;
+  const auto parallelTaskId = veloxCfg_->get<std::string>(kParallelTaskId, "");
+  if (!parallelTaskId.empty()) {
+    startParallelTask(parallelTaskId, spillDir);
+  } else {
+    std::unordered_set<velox::core::PlanNodeId> emptySet;
+    const bool serialExecution = true;
 
-  facebook::velox::exec::CursorParameters params;
-  params.planNode = planNode;
-  params.destination = 0;
-  params.maxDrivers = 1;
-  params.queryCtx = createNewVeloxQueryCtx();
-  params.executionStrategy = velox::core::ExecutionStrategy::kUngrouped;
-  params.groupedExecutionLeafNodeIds = std::move(emptySet);
-  params.numSplitGroups = 1;
-  params.spillDirectory = spillDir;
-  params.serialExecution = serialExecution;
-  params.copyResult = false;
-  params.outputPool = memoryManager_->getLeafMemoryPool();
-  cursor_ = velox::exec::TaskCursor::create(params);
-  task_ = cursor_->task().get();
-  if (!task_->supportSerialExecutionMode()) {
-    throw std::runtime_error("Task doesn't support single threaded execution: " + planNode->toString());
+    facebook::velox::exec::CursorParameters params;
+    params.planNode = planNode;
+    params.destination = 0;
+    params.maxDrivers = 1;
+    params.queryCtx = createNewVeloxQueryCtx();
+    params.executionStrategy = velox::core::ExecutionStrategy::kUngrouped;
+    params.groupedExecutionLeafNodeIds = std::move(emptySet);
+    params.numSplitGroups = 1;
+    params.spillDirectory = spillDir;
+    params.serialExecution = serialExecution;
+    params.copyResult = false;
+    params.outputPool = memoryManager_->getLeafMemoryPool();
+    cursor_ = velox::exec::TaskCursor::create(params);
+    task_ = cursor_->task().get();
+    if (!task_->supportSerialExecutionMode()) {
+      throw std::runtime_error("Task doesn't support single threaded execution: " + planNode->toString());
+    }
   }
 
   // Generate splits for all scan nodes.
@@ -305,6 +333,9 @@ std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQ
 }
 
 std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
+  if (parallelTask_ != nullptr) {
+    return nextParallel();
+  }
   while (true) {
     if (!cursor_->moveNext()) {
       return nullptr;
@@ -448,8 +479,172 @@ void WholeStageResultIterator::noMoreSplits() {
   for (const auto& streamId : streamIds_) {
     task_->noMoreSplits(streamId);
   }
-  cursor_->setNoMoreSplits();
+  if (cursor_ != nullptr) {
+    cursor_->setNoMoreSplits();
+  }
   allSplitsAdded_ = true;
+}
+
+void WholeStageResultIterator::addRemoteSplit(const velox::core::PlanNodeId& nodeId, const std::string& url) {
+  GLUTEN_CHECK(parallelTask_ != nullptr, "Remote splits require a parallel task");
+  task_->addSplit(nodeId, velox::exec::Split(std::make_shared<velox::exec::RemoteConnectorSplit>(url)));
+}
+
+void WholeStageResultIterator::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
+  GLUTEN_CHECK(parallelTask_ != nullptr, "Output buffers need a parallel task");
+  parallelTask_->updateOutputBuffers(numBuffers, noMoreBuffers);
+}
+
+void WholeStageResultIterator::noMoreRemoteSplits(const velox::core::PlanNodeId& nodeId) {
+  GLUTEN_CHECK(parallelTask_ != nullptr, "Remote splits require a parallel task");
+  task_->noMoreSplits(nodeId);
+}
+
+std::shared_ptr<const velox::core::PlanNode> WholeStageResultIterator::addPartitionedOutput(
+    const std::shared_ptr<const velox::core::PlanNode>& planNode,
+    const std::string& spec) {
+  if (spec.empty()) {
+    return planNode;
+  }
+  // spec is "single", "arbitrary", "broadcast:<partitions>", "roundrobin:<partitions>" or
+  // "hash:<partitions>:<key channels>[:replicate]", where replicate sends rows with null keys and
+  // one arbitrary row to every partition.
+  std::vector<std::string> parts;
+  folly::split(':', spec, parts);
+  const auto& type = planNode->outputType();
+  const auto serde = velox::VectorSerde::kindName(velox::VectorSerde::Kind::kPresto);
+  const std::string transport{velox::core::TransportKind::kUcx};
+  const std::string id = "partitioned_output";
+  if (parts[0] == "single") {
+    return velox::core::PartitionedOutputNode::single(id, type, serde, transport, planNode);
+  }
+  if (parts[0] == "arbitrary") {
+    return velox::core::PartitionedOutputNode::arbitrary(id, type, serde, transport, planNode);
+  }
+  GLUTEN_CHECK(parts.size() >= 2, "Invalid partitioned output: " + spec);
+  const int numPartitions = folly::to<int>(parts[1]);
+  if (parts[0] == "broadcast") {
+    return velox::core::PartitionedOutputNode::broadcast(id, numPartitions, type, serde, transport, planNode);
+  }
+  if (parts[0] == "roundrobin") {
+    return std::make_shared<velox::core::PartitionedOutputNode>(
+        id,
+        velox::core::PartitionedOutputNode::Kind::kPartitioned,
+        std::vector<velox::core::TypedExprPtr>{},
+        numPartitions,
+        false,
+        std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
+        type,
+        serde,
+        transport,
+        planNode);
+  }
+  GLUTEN_CHECK(
+      parts[0] == "hash" && (parts.size() == 3 || (parts.size() == 4 && parts[3] == "replicate")),
+      "Invalid partitioned output: " + spec);
+  // Velox rejects partitioning keys on a single partition, which Trino plans on a one-worker cluster.
+  if (numPartitions == 1) {
+    return velox::core::PartitionedOutputNode::single(id, type, serde, transport, planNode);
+  }
+  const bool replicateNullsAndAny = parts.size() == 4;
+  std::vector<velox::column_index_t> channels;
+  std::vector<velox::core::TypedExprPtr> keys;
+  std::vector<std::string> channelStrings;
+  folly::split(',', parts[2], channelStrings);
+  for (const auto& channelString : channelStrings) {
+    const auto channel = folly::to<velox::column_index_t>(channelString);
+    channels.push_back(channel);
+    keys.push_back(std::make_shared<velox::core::FieldAccessTypedExpr>(type->childAt(channel), type->nameOf(channel)));
+  }
+  return std::make_shared<velox::core::PartitionedOutputNode>(
+      id,
+      velox::core::PartitionedOutputNode::Kind::kPartitioned,
+      keys,
+      numPartitions,
+      replicateNullsAndAny,
+      std::make_shared<velox::exec::HashPartitionFunctionSpec>(type, std::move(channels)),
+      type,
+      serde,
+      transport,
+      planNode);
+}
+
+void WholeStageResultIterator::startParallelTask(const std::string& taskId, const std::string& spillDir) {
+  veloxPlan_ = addPartitionedOutput(veloxPlan_, veloxCfg_->get<std::string>(kParallelPartitionedOutput, ""));
+  velox::exec::ConsumerSupplier consumerSupplier;
+  if (std::dynamic_pointer_cast<const velox::core::PartitionedOutputNode>(veloxPlan_) == nullptr) {
+    consumerSupplier = [this]() -> velox::exec::Consumer {
+      return [this](velox::RowVectorPtr vector, bool drained, velox::ContinueFuture* future) {
+        if (drained || vector == nullptr) {
+          return velox::exec::BlockingReason::kNotBlocked;
+        }
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        outputs_.push_back(std::static_pointer_cast<velox::RowVector>(
+            velox::BaseVector::copy(*vector, memoryManager_->getLeafMemoryPool().get())));
+        outputCv_.notify_all();
+        if (outputs_.size() < kMaxQueuedOutputs) {
+          return velox::exec::BlockingReason::kNotBlocked;
+        }
+        auto [promise, waitFuture] = velox::makeVeloxContinuePromiseContract("WholeStageResultIterator::output");
+        outputPromises_.push_back(std::move(promise));
+        *future = std::move(waitFuture);
+        return velox::exec::BlockingReason::kWaitForConsumer;
+      };
+    };
+  }
+  velox::common::SpillDiskOptions spillDiskOpts;
+  spillDiskOpts.spillDirPath = spillDir + "/" + taskId;
+  spillDiskOpts.spillDirCreated = false;
+  spillDiskOpts.spillDirCreateCb = [path = spillDiskOpts.spillDirPath]() {
+    velox::filesystems::getFileSystem(path, nullptr)->mkdir(path);
+    return path;
+  };
+  velox::core::PlanFragment fragment(veloxPlan_);
+  // AssignUniqueId puts this in the high bits of its ids to keep them unique across the stage.
+  fragment.taskUniqueId = taskPartition(taskId);
+  parallelTask_ = velox::exec::Task::create(
+      taskId,
+      std::move(fragment),
+      0,
+      createNewVeloxQueryCtx(),
+      velox::exec::Task::ExecutionMode::kParallel,
+      std::move(consumerSupplier),
+      0,
+      std::move(spillDiskOpts));
+  task_ = parallelTask_.get();
+  parallelTask_->start(veloxCfg_->get<uint32_t>(kParallelMaxDrivers, 1));
+}
+
+std::shared_ptr<ColumnarBatch> WholeStageResultIterator::nextParallel() {
+  std::unique_lock<std::mutex> lock(outputMutex_);
+  while (true) {
+    if (!outputs_.empty()) {
+      auto vector = std::move(outputs_.front());
+      outputs_.pop_front();
+      for (auto& promise : outputPromises_) {
+        promise.setValue();
+      }
+      outputPromises_.clear();
+      return std::make_shared<VeloxColumnarBatch>(std::move(vector));
+    }
+    const auto state = parallelTask_->state();
+    if (state == velox::exec::TaskState::kFinished) {
+      if (veloxCfg_->get<bool>(kShowTaskMetricsWhenFinished, kShowTaskMetricsWhenFinishedDefault) &&
+          !parallelStatsLogged_) {
+        parallelStatsLogged_ = true;
+        LOG(WARNING) << "Native task " << parallelTask_->taskId() << " stats:\n"
+                  << velox::exec::printPlanWithStats(*veloxPlan_, parallelTask_->taskStats(), true);
+      }
+      return nullptr;
+    }
+    if (state != velox::exec::TaskState::kRunning) {
+      if (auto error = parallelTask_->error()) {
+        std::rethrow_exception(error);
+      }
+      throw GlutenException("Velox task " + parallelTask_->taskId() + " ended in state " + velox::exec::taskStateString(state));
+    }
+    outputCv_.wait_for(lock, std::chrono::milliseconds(100));
+  }
 }
 
 void WholeStageResultIterator::requestBarrier() {

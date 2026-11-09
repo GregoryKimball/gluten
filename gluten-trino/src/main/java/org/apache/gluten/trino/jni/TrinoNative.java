@@ -71,5 +71,13 @@ public final class TrinoNative {
   /** Returns the next output page in the {@link NativePageSource} layout, or null when done. */
   public static native byte[] next(long handle);
 
+  /** Adds an upstream task's result location to the UCX exchange reading plan input {@code input}. */
+  public static native void addRemoteSplit(long handle, int input, String location);
+
+  public static native void noMoreRemoteSplits(long handle, int input);
+
+  /** Sets the final destination count of a broadcast or arbitrary UCX output. */
+  public static native void noMoreOutputBuffers(long handle, int numBuffers);
+
   public static native void close(long handle);
 }
