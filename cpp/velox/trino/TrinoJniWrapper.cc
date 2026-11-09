@@ -33,6 +33,8 @@
 #include "compute/ResultIterator.h"
 #include "compute/Runtime.h"
 #include "compute/VeloxBackend.h"
+#include "config/GlutenConfig.h"
+#include "config/VeloxConfig.h"
 #include "memory/AllocationListener.h"
 #include "memory/MemoryManager.h"
 #include "memory/VeloxColumnarBatch.h"
@@ -42,11 +44,23 @@
 #include "threads/ThreadInitializer.h"
 #include "threads/ThreadManager.h"
 #include "trino/TrinoPageSerde.h"
+#include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
+#include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#ifdef GLUTEN_ENABLE_GPU
+#include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#endif
 
 using namespace facebook::velox;
 
 namespace gluten::trino {
 namespace {
+
+// Gluten registers Spark functions without a prefix. Trino plans call the
+// Presto functions, whose semantics match Trino's, under this prefix.
+const std::string kPrestoPrefix = "presto.";
 
 JavaVM* gVm = nullptr;
 jclass gRuntimeExceptionClass = nullptr;
@@ -223,6 +237,18 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_initialize( 
     jobjectArray confValues) {
   TRINO_JNI_START
   VeloxBackend::create(AllocationListener::noop(), toConf(env, confKeys, confValues));
+  functions::prestosql::registerAllScalarFunctions(kPrestoPrefix);
+  aggregate::prestosql::registerAllAggregateFunctions(kPrestoPrefix);
+#ifdef GLUTEN_ENABLE_GPU
+  if (VeloxBackend::get()->getBackendConf()->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
+    cudf_velox::CudfConfig::getInstance().functionNamePrefix = kPrestoPrefix;
+    // registerCudf() ran inside VeloxBackend::create() with an empty prefix, so the built-in
+    // arithmetic, comparison and cast functions exist only under unprefixed names.
+    cudf_velox::registerBuiltinFunctions(kPrestoPrefix);
+    cudf_velox::registerPrestoFunctions(kPrestoPrefix);
+    cudf_velox::registerPrestoAggregateFunctions(kPrestoPrefix);
+  }
+#endif
   TRINO_JNI_END()
 }
 
@@ -240,8 +266,9 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_trino_jni_TrinoNative_createTask(
   auto task = std::make_unique<TrinoTask>();
   task->memoryManager = MemoryManager::create(kVeloxBackendKind, AllocationListener::noop());
   task->threadManager = ThreadManager::create(kVeloxBackendKind, ThreadInitializer::noop());
-  task->runtime = Runtime::create(
-      kVeloxBackendKind, task->memoryManager, task->threadManager, toConf(env, confKeys, confValues));
+  auto conf = toConf(env, confKeys, confValues);
+  conf[kSubstraitDialect] = "presto";
+  task->runtime = Runtime::create(kVeloxBackendKind, task->memoryManager, task->threadManager, conf);
 
   auto planBytes = toBytes(env, plan);
   task->runtime->parsePlan(reinterpret_cast<const uint8_t*>(planBytes.data()), planBytes.size());

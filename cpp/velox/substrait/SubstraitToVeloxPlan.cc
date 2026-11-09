@@ -408,6 +408,9 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       if (sJoin.has_advanced_extension() &&
           SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isExistenceJoin=")) {
         joinType = core::JoinType::kLeftSemiProject;
+        // Presto plans IN subqueries as null-aware semi joins that project the match.
+        isNullAwareAntiJoin = prestoDialect_ &&
+            SubstraitParser::configSetInOptimization(sJoin.advanced_extension(), "isNullAwareAntiJoin=");
       } else {
         joinType = core::JoinType::kLeftSemiFilter;
       }
@@ -1624,7 +1627,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   // Otherwise, will create TableScan node for ReadRel.
   auto splitInfo = std::make_shared<SplitInfo>();
   splitInfo->leafType = SplitInfo::LeafType::TABLE_SCAN;
-  if (!validationMode_) {
+  if (!validationMode_ && !readRel.has_virtual_table()) {
     VELOX_CHECK_LT(splitInfoIdx_, splitInfos_.size(), "Plan must have readRel and related split info.");
     splitInfo = splitInfos_[splitInfoIdx_++];
 #ifdef ENABLE_KAFKA
@@ -1831,7 +1834,11 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   auto outputType = ROW(std::move(outNames), std::move(veloxTypeList));
 
   if (readRel.has_virtual_table()) {
-    return toVeloxPlan(readRel, outputType);
+    auto valuesNode = toVeloxPlan(readRel, outputType);
+    auto valuesSplitInfo = std::make_shared<SplitInfo>();
+    valuesSplitInfo->leafType = SplitInfo::LeafType::TRIVIAL_LEAF;
+    splitInfoMap_[valuesNode->id()] = valuesSplitInfo;
+    return valuesNode;
   } else {
     auto tableScanNode = std::make_shared<core::TableScanNode>(
         nextPlanNodeId(), std::move(outputType), std::move(tableHandle), assignments);
@@ -1981,12 +1988,12 @@ void SubstraitToVeloxPlanConverter::constructFunctionMap(const ::substrait::Plan
     auto name = sFmap.name();
     functionMap_[id] = name;
   }
-  exprConverter_ = std::make_unique<SubstraitVeloxExprConverter>(pool_, functionMap_);
+  exprConverter_ = std::make_unique<SubstraitVeloxExprConverter>(pool_, functionMap_, prestoDialect_);
 }
 
 void SubstraitToVeloxPlanConverter::constructFunctionMap(std::unordered_map<uint64_t, std::string> substraitPlan) {
   functionMap_ = std::move(substraitPlan);
-  exprConverter_ = std::make_unique<SubstraitVeloxExprConverter>(pool_, functionMap_);
+  exprConverter_ = std::make_unique<SubstraitVeloxExprConverter>(pool_, functionMap_, prestoDialect_);
 }
 
 std::string SubstraitToVeloxPlanConverter::findFuncSpec(uint64_t id) {

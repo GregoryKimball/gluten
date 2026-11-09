@@ -34,10 +34,12 @@ class SubstraitVeloxExprConverter {
   /// subParser: A Substrait parser used to convert Substrait representations
   /// into recognizable representations. functionMap: A pre-constructed map
   /// storing the relations between the function id and the function name.
+  /// prestoDialect: whether casts follow Presto rather than Spark semantics.
   explicit SubstraitVeloxExprConverter(
       memory::MemoryPool* pool,
-      const std::unordered_map<uint64_t, std::string>& functionMap)
-      : pool_(pool), functionMap_(functionMap) {}
+      const std::unordered_map<uint64_t, std::string>& functionMap,
+      bool prestoDialect = false)
+      : pool_(pool), functionMap_(functionMap), prestoDialect_(prestoDialect) {}
 
   /// Stores the variant and its type.
   struct TypedVariant {
@@ -102,6 +104,8 @@ class SubstraitVeloxExprConverter {
   /// The map storing the relations between the function id and the function
   /// name.
   std::unordered_map<uint64_t, std::string> functionMap_;
+
+  bool prestoDialect_;
 
   // The map storing the Substrait extract function input field and velox
   // function name.

@@ -22,6 +22,7 @@
 #include "SubstraitToVeloxExpr.h"
 #include "TypeUtils.h"
 #include "compute/VeloxConnectorIds.h"
+#include "config/VeloxConfig.h"
 #include "velox/connectors/hive/FileProperties.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/PlanNode.h"
@@ -99,6 +100,9 @@ class SubstraitToVeloxPlanConverter {
         writeFileName_(writeFileName),
         validationMode_(validationMode) {
     VELOX_USER_CHECK_NOT_NULL(veloxCfg_);
+    const auto dialect = veloxCfg_->get<std::string>(kSubstraitDialect, kSubstraitDialectDefault);
+    VELOX_USER_CHECK(dialect == "spark" || dialect == "presto", "Unknown {}: {}", kSubstraitDialect, dialect);
+    prestoDialect_ = dialect == "presto";
   }
 
   /// Used to convert Substrait WriteRel into Velox PlanNode.
@@ -330,6 +334,9 @@ class SubstraitToVeloxPlanConverter {
 
   /// A flag used to specify validation.
   bool validationMode_ = false;
+
+  /// Whether the plan follows Presto rather than Spark semantics, as Trino plans do.
+  bool prestoDialect_ = false;
 };
 
 } // namespace gluten
