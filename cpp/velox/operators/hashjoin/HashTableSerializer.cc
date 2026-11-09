@@ -20,6 +20,23 @@
 
 namespace gluten {
 
+#ifdef GLUTEN_UPSTREAM_VELOX
+template <bool ignoreNullKeys>
+size_t HashTableSerializer::serializedSize(const facebook::velox::exec::HashTable<ignoreNullKeys>*) {
+  VELOX_UNSUPPORTED("Hash table serialization requires Gluten's Velox");
+}
+
+template <bool ignoreNullKeys>
+void HashTableSerializer::serializeTo(const facebook::velox::exec::HashTable<ignoreNullKeys>*, uint8_t*, size_t) {
+  VELOX_UNSUPPORTED("Hash table serialization requires Gluten's Velox");
+}
+
+template <bool ignoreNullKeys>
+std::unique_ptr<facebook::velox::exec::HashTable<ignoreNullKeys>>
+HashTableSerializer::deserialize(const uint8_t*, size_t, facebook::velox::memory::MemoryPool*) {
+  VELOX_UNSUPPORTED("Hash table serialization requires Gluten's Velox");
+}
+#else
 template <bool ignoreNullKeys>
 size_t HashTableSerializer::serializedSize(const facebook::velox::exec::HashTable<ignoreNullKeys>* hashTable) {
   VELOX_CHECK_NOT_NULL(hashTable, "Hash table cannot be null");
@@ -44,6 +61,7 @@ HashTableSerializer::deserialize(const uint8_t* data, size_t size, facebook::vel
   VELOX_CHECK_NOT_NULL(pool, "Memory pool cannot be null");
   return facebook::velox::exec::HashTable<ignoreNullKeys>::deserializeFrom(data, size, pool);
 }
+#endif
 
 template size_t HashTableSerializer::serializedSize<true>(const facebook::velox::exec::HashTable<true>*);
 

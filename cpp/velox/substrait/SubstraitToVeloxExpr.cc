@@ -702,6 +702,12 @@ core::TypedExprPtr SubstraitVeloxExprConverter::toVeloxExpr(
     const RowTypePtr& inputType) {
   auto type = SubstraitParser::parseType(castExpr.type());
   std::vector<core::TypedExprPtr> inputs{toVeloxExpr(castExpr.input(), inputType)};
+  if (prestoDialect_) {
+    return std::make_shared<core::CastTypedExpr>(
+        type,
+        std::move(inputs),
+        castExpr.failure_behavior() == ::substrait::Expression_Cast_FailureBehavior_FAILURE_BEHAVIOR_RETURN_NULL);
+  }
   switch (sparkCastMode(castExpr.failure_behavior())) {
     case SparkCastMode::kLegacy:
       return std::make_shared<const core::CallTypedExpr>(type, std::move(inputs), kSparkLegacyCast);

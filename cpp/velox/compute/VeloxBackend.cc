@@ -221,7 +221,19 @@ void VeloxBackend::init(
           {velox::cudf_velox::CudfConfig::kCudfMemoryPercent,
            backendConf_->get(kCudfMemoryPercent, kCudfMemoryPercentDefault)},
           {velox::cudf_velox::CudfConfig::kCudfAllowCpuFallback,
-           backendConf_->get(kCudfAllowCpuFallback, kCudfAllowCpuFallbackDefault)}};
+           backendConf_->get(kCudfAllowCpuFallback, kCudfAllowCpuFallbackDefault)},
+          {velox::cudf_velox::CudfConfig::kUcxExchange, backendConf_->get(kCudfExchange, kCudfExchangeDefault)},
+          {velox::cudf_velox::CudfConfig::kUcxxErrorHandling,
+           backendConf_->get(kCudfUcxxErrorHandling, kCudfUcxxErrorHandlingDefault)},
+          {velox::cudf_velox::CudfConfig::kUcxxBlockingProgress,
+           backendConf_->get(kCudfUcxxBlockingProgress, kCudfUcxxBlockingProgressDefault)}};
+      // Any other cuDF option, e.g. spark.gluten.velox.cudf.concat_optimization_enabled.
+      const std::string cudfPrefix = kStaticBackendConfPrefix + "cudf.";
+      for (const auto& [key, value] : backendConf_->rawConfigs()) {
+        if (key.starts_with(cudfPrefix)) {
+          options[key.substr(kStaticBackendConfPrefix.size())] = value;
+        }
+      }
       auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
       cudfConfig.initialize(std::move(options));
       velox::cudf_velox::registerCudf();
@@ -250,6 +262,12 @@ void VeloxBackend::init(
   const auto spillThreadNum = backendConf_->get<uint32_t>(kSpillThreadNum, kSpillThreadNumDefaultValue);
   if (spillThreadNum > 0) {
     spillExecutor_ = std::make_unique<folly::CPUThreadPoolExecutor>(spillThreadNum);
+  }
+
+  // Spark runs Velox tasks serially on its own threads; parallel tasks need driver threads.
+  const auto taskThreads = backendConf_->get<int32_t>(kVeloxTaskThreads, 0);
+  if (taskThreads > 0) {
+    executor_ = std::make_unique<folly::CPUThreadPoolExecutor>(taskThreads);
   }
 
   const auto ioThreads = backendConf_->get<int32_t>(kVeloxIOThreads, numTaskSlotsPerExecutor);

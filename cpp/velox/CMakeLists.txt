@@ -257,6 +257,21 @@ set_target_properties(gluten_velox_impl PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(velox SHARED jni/VeloxJniWrapper.cc)
 target_link_libraries(velox PUBLIC gluten_velox_impl gluten)
 
+option(BUILD_TRINO "Build libgluten_trino.so for the Trino integration" OFF)
+# The Trino integration builds against upstream Velox, which lacks the
+# hash-table serialization and extensible bloom filter of Gluten's Velox pin.
+option(GLUTEN_UPSTREAM_VELOX "Build against upstream Velox" ${BUILD_TRINO})
+if(GLUTEN_UPSTREAM_VELOX)
+  target_compile_definitions(gluten_velox_impl PRIVATE GLUTEN_UPSTREAM_VELOX)
+endif()
+if(BUILD_TRINO)
+  add_library(gluten_trino SHARED trino/TrinoJniWrapper.cc
+                                  trino/TrinoPageSerde.cc)
+  target_link_libraries(gluten_trino PUBLIC gluten_velox_impl gluten)
+  set_target_properties(gluten_trino PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                ${root_directory}/releases)
+endif()
+
 if(ENABLE_GLUTEN_VCPKG)
   find_package(xxHash CONFIG REQUIRED)
   target_link_libraries(gluten_velox_impl PUBLIC xxHash::xxhash)
@@ -670,6 +685,14 @@ if(ENABLE_GPU)
            facebook::velox::velox_cudf_expression_registry
            cudf::cudf
            velox_curl)
+
+  # velox_cudf_exec embeds the UCX exchange objects but not their shared
+  # library dependencies.
+  if(EXISTS ${VELOX_BUILD_PATH}/_deps/ucxx-build/ucxx-config.cmake)
+    set(ucxx_DIR "${VELOX_BUILD_PATH}/_deps/ucxx-build")
+    find_package(ucxx CONFIG REQUIRED)
+    target_link_libraries(gluten_velox_impl PUBLIC ucxx::ucxx)
+  endif()
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")

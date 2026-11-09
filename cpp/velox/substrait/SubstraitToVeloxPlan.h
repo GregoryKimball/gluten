@@ -22,6 +22,7 @@
 #include "SubstraitToVeloxExpr.h"
 #include "TypeUtils.h"
 #include "compute/VeloxConnectorIds.h"
+#include "config/VeloxConfig.h"
 #include "velox/connectors/hive/FileProperties.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/PlanNode.h"
@@ -29,6 +30,12 @@
 
 namespace gluten {
 class ResultIterator;
+
+/// Plan node id of the UCX exchange reading remote input 'index'; remote splits for the input are
+/// added to this node.
+inline std::string ucxExchangeNodeId(int32_t index) {
+  return "ucx_exchange_" + std::to_string(index);
+}
 
 struct SplitInfo {
   enum class LeafType {
@@ -99,6 +106,9 @@ class SubstraitToVeloxPlanConverter {
         writeFileName_(writeFileName),
         validationMode_(validationMode) {
     VELOX_USER_CHECK_NOT_NULL(veloxCfg_);
+    const auto dialect = veloxCfg_->get<std::string>(kSubstraitDialect, kSubstraitDialectDefault);
+    VELOX_USER_CHECK(dialect == "spark" || dialect == "presto", "Unknown {}: {}", kSubstraitDialect, dialect);
+    prestoDialect_ = dialect == "presto";
   }
 
   /// Used to convert Substrait WriteRel into Velox PlanNode.
@@ -118,6 +128,13 @@ class SubstraitToVeloxPlanConverter {
 
   /// Used to convert Substrait SetRel into Velox PlanNode.
   core::PlanNodePtr toVeloxPlan(const ::substrait::SetRel& setRel);
+
+  /// Used to convert Substrait ExchangeRel into a Velox LocalPartitionNode.
+  core::PlanNodePtr toVeloxPlan(const ::substrait::ExchangeRel& exchangeRel);
+
+  /// Used to convert Substrait ExtensionSingleRel with detail "AssignUniqueId" into a Velox
+  /// AssignUniqueIdNode.
+  core::PlanNodePtr toVeloxPlan(const ::substrait::ExtensionSingleRel& extensionRel);
 
   /// Used to convert Substrait JoinRel into Velox PlanNode.
   core::PlanNodePtr toVeloxPlan(const ::substrait::JoinRel& joinRel);
@@ -155,6 +172,9 @@ class SubstraitToVeloxPlanConverter {
 
   // Construct a table scan node accepting value streams as input.
   core::PlanNodePtr constructValueStreamNode(const ::substrait::ReadRel& sRead, int32_t streamIdx);
+
+  // Construct a UCX exchange for a ReadRel reading "ucx:${index}", or return null for other reads.
+  core::PlanNodePtr constructUcxExchangeNode(const ::substrait::ReadRel& sRead);
 
   // Construct a cuDF value stream node.
   core::PlanNodePtr constructCudfValueStreamNode(const ::substrait::ReadRel& sRead, int32_t streamIdx);
@@ -330,6 +350,9 @@ class SubstraitToVeloxPlanConverter {
 
   /// A flag used to specify validation.
   bool validationMode_ = false;
+
+  /// Whether the plan follows Presto rather than Spark semantics, as Trino plans do.
+  bool prestoDialect_ = false;
 };
 
 } // namespace gluten
