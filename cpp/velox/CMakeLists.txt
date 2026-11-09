@@ -257,6 +257,15 @@ set_target_properties(gluten_velox_impl PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(velox SHARED jni/VeloxJniWrapper.cc)
 target_link_libraries(velox PUBLIC gluten_velox_impl gluten)
 
+option(BUILD_TRINO "Build libgluten_trino.so for the Trino integration" OFF)
+if(BUILD_TRINO)
+  add_library(gluten_trino SHARED trino/TrinoJniWrapper.cc
+                                  trino/TrinoPageSerde.cc)
+  target_link_libraries(gluten_trino PUBLIC gluten_velox_impl gluten)
+  set_target_properties(gluten_trino PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                ${root_directory}/releases)
+endif()
+
 if(ENABLE_GLUTEN_VCPKG)
   find_package(xxHash CONFIG REQUIRED)
   target_link_libraries(gluten_velox_impl PUBLIC xxHash::xxhash)
